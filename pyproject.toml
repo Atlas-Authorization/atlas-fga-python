@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atlas-fga"
+version = "0.1.0"
+description = "Atlas FGA client for Python — fine-grained, OpenFGA-shaped relationship authorization, preconfigured for Atlas. Dependency-free (stdlib only)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Atlas" }]
+keywords = ["atlas", "atlasauth", "fga", "openfga", "authorization", "zanzibar", "rebac"]
+# Zero runtime dependencies: the client speaks HTTP over the standard library's
+# urllib, so it installs with no transitive weight.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "mypy>=1.5", "ruff>=0.4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["atlas_fga"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.mypy]
+python_version = "3.10"
+disallow_untyped_defs = true
+check_untyped_defs = true
+files = ["atlas_fga", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

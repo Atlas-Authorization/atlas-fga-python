@@ -139,5 +139,87 @@ class AtlasFgaTests(unittest.TestCase):
             AtlasFga(transport=self.fake.transport)
 
 
+class ScriptedTests(unittest.TestCase):
+    """Request-shape and response-parsing tests with canned replies."""
+
+    def make(self, *replies: Any) -> Tuple[AtlasFga, List[Dict[str, Any]]]:
+        calls: List[Dict[str, Any]] = []
+        queue = list(replies)
+
+        def transport(method: str, url: str, headers: Dict[str, str], body: Optional[bytes]) -> Tuple[int, bytes]:
+            calls.append({"method": method, "url": url, "body": json.loads(body) if body else None})
+            return 200, json.dumps(queue.pop(0)).encode()
+
+        return AtlasFga(secret_key="sk_test", store_id="s1", transport=transport), calls
+
+    def test_condition_context_consistency_on_check(self) -> None:
+        fga, calls = self.make(
+            {"object": "fga.write_result", "writes": 1, "deletes": 0, "consistency_token": "tok1"},
+            {"object": "fga.check", "allowed": True, "authorization_model_id": "m", "consistency_token": "tok2"},
+        )
+        cond = {"name": "in_window", "context": {"start": "a"}}
+        w = fga.write(writes=[{"user": "user:a", "relation": "viewer", "object": "doc:1", "condition": cond}])
+        self.assertEqual(calls[0]["body"]["writes"][0]["condition"], cond)
+        self.assertEqual(w.consistency_token, "tok1")
+        r = fga.check(user="user:a", relation="viewer", object="doc:1", context={"now": "t"},
+                      consistency="HIGHER_CONSISTENCY", consistency_token=w.consistency_token)
+        self.assertEqual(calls[1]["body"]["context"], {"now": "t"})
+        self.assertEqual(calls[1]["body"]["consistency"], "HIGHER_CONSISTENCY")
+        self.assertEqual(calls[1]["body"]["consistency_token"], "tok1")
+        self.assertEqual(r.consistency_token, "tok2")
+
+    def test_batch_check_and_list_objects_fields(self) -> None:
+        fga, calls = self.make(
+            {"object": "fga.batch_check", "result": [], "consistency_token": "b"},
+            {"object": "fga.list_objects", "objects": [], "consistency_token": "l"},
+        )
+        res = fga.batch_check([{"user": "u:a", "relation": "v", "object": "d:1", "context": {"x": 1}}],
+                              consistency="MINIMIZE_LATENCY")
+        self.assertEqual(calls[0]["body"]["checks"][0]["context"], {"x": 1})
+        self.assertEqual(calls[0]["body"]["consistency"], "MINIMIZE_LATENCY")
+        self.assertEqual(res.consistency_token, "b")
+        lo = fga.list_objects(user="u:a", relation="v", type="d", context={"y": 2}, consistency_token="t")
+        self.assertEqual(calls[1]["body"]["context"], {"y": 2})
+        self.assertEqual(calls[1]["body"]["consistency_token"], "t")
+        self.assertEqual(lo.consistency_token, "l")
+
+    def test_list_users_and_all_pages(self) -> None:
+        page = lambda users, tok, ex=(): {  # noqa: E731
+            "object": "fga.list_users", "users": users, "excluded_users": list(ex),
+            "continuation_token": tok, "authorization_model_id": "m", "consistency_token": "c",
+        }
+        fga, calls = self.make(page(["user:a", "user:*"], "next", ["user:x"]), page(["user:b"], None, ["user:x"]))
+        res = fga.list_all_users(object="doc:1", relation="viewer", user_filters=[{"type": "user"}], page_size=2)
+        self.assertEqual(calls[0]["url"], "https://api.atlasauth.net/v1/fga/stores/s1/list-users")
+        self.assertEqual(calls[0]["body"]["user_filters"], [{"type": "user"}])
+        self.assertEqual(calls[0]["body"]["page_size"], 2)
+        self.assertNotIn("continuation_token", calls[0]["body"])
+        self.assertEqual(calls[1]["body"]["continuation_token"], "next")
+        self.assertEqual(res.users, ["user:a", "user:*", "user:b"])
+        self.assertEqual(res.excluded_users, ["user:x"])
+        self.assertIsNone(res.continuation_token)
+
+    def test_read_changes_and_iter(self) -> None:
+        change = lambda op: {  # noqa: E731
+            "object": "fga.tuple_change", "operation": op, "user": "user:a", "relation": "viewer",
+            "target": "doc:1", "consistency_token": "t", "created_at": 5,
+        }
+        fga, calls = self.make(
+            {"object": "list", "data": [change("write")], "has_more": True, "continuation_token": "c1"},
+            {"object": "list", "data": [{**change("delete"), "condition": {"name": "n"}}], "has_more": False,
+             "continuation_token": "c2"},
+        )
+        pages = list(fga.iter_changes(type="doc", page_size=1, start_time="2026-01-01T00:00:00Z"))
+        self.assertEqual(calls[0]["method"], "GET")
+        self.assertEqual(
+            calls[0]["url"],
+            "https://api.atlasauth.net/v1/fga/stores/s1/changes?type=doc&page_size=1&start_time=2026-01-01T00%3A00%3A00Z",
+        )
+        self.assertIn("continuation_token=c1", calls[1]["url"])
+        self.assertEqual([p.data[0].operation for p in pages], ["write", "delete"])
+        self.assertEqual(pages[1].data[0].condition, {"name": "n"})
+        self.assertEqual(pages[1].continuation_token, "c2")
+
+
 if __name__ == "__main__":
     unittest.main()

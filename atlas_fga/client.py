@@ -7,8 +7,8 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import quote
+from typing import Any, Callable, Dict, Iterator, List, Optional
+from urllib.parse import quote, urlencode
 
 DEFAULT_BASE_URL = "https://api.atlasauth.net"
 
@@ -16,8 +16,13 @@ DEFAULT_BASE_URL = "https://api.atlasauth.net"
 #: The default is urllib-based; tests inject their own.
 Transport = Callable[[str, str, Dict[str, str], Optional[bytes]], "tuple[int, bytes]"]
 
-# A tuple key is just a mapping with user / relation / object.
-TupleKey = Dict[str, str]
+# A tuple key is a mapping with user / relation / object, plus an optional
+# ``condition``: ``{"name": str, "context": {...}}`` (context optional).
+TupleKey = Dict[str, Any]
+
+#: Read-consistency modes: "UNSPECIFIED", "MINIMIZE_LATENCY" (default; may be
+#: served from a short-lived cache) or "HIGHER_CONSISTENCY" (bypasses it).
+Consistency = str
 
 
 # ---- wire types --------------------------------------------------------------
@@ -28,6 +33,7 @@ class CheckResult:
     allowed: bool
     authorization_model_id: str = ""
     object: str = "fga.check"
+    consistency_token: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "CheckResult":
@@ -35,6 +41,7 @@ class CheckResult:
             allowed=bool(d.get("allowed", False)),
             authorization_model_id=d.get("authorization_model_id", ""),
             object=d.get("object", "fga.check"),
+            consistency_token=d.get("consistency_token"),
         )
 
 
@@ -43,6 +50,7 @@ class WriteResult:
     writes: int
     deletes: int
     object: str = "fga.write_result"
+    consistency_token: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "WriteResult":
@@ -50,6 +58,7 @@ class WriteResult:
             writes=int(d.get("writes", 0)),
             deletes=int(d.get("deletes", 0)),
             object=d.get("object", "fga.write_result"),
+            consistency_token=d.get("consistency_token"),
         )
 
 
@@ -58,6 +67,7 @@ class ListObjectsResult:
     objects: List[str]
     authorization_model_id: str = ""
     object: str = "fga.list_objects"
+    consistency_token: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ListObjectsResult":
@@ -65,6 +75,30 @@ class ListObjectsResult:
             objects=list(d.get("objects", [])),
             authorization_model_id=d.get("authorization_model_id", ""),
             object=d.get("object", "fga.list_objects"),
+            consistency_token=d.get("consistency_token"),
+        )
+
+
+@dataclass
+class ListUsersResult:
+    """Users as ``type:id``, usersets as ``type:id#relation`` or wildcard ``type:*``."""
+
+    users: List[str]
+    excluded_users: List[str] = field(default_factory=list)
+    continuation_token: Optional[str] = None
+    authorization_model_id: str = ""
+    consistency_token: Optional[str] = None
+    object: str = "fga.list_users"
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ListUsersResult":
+        return cls(
+            users=list(d.get("users", [])),
+            excluded_users=list(d.get("excluded_users", [])),
+            continuation_token=d.get("continuation_token"),
+            authorization_model_id=d.get("authorization_model_id", ""),
+            consistency_token=d.get("consistency_token"),
+            object=d.get("object", "fga.list_users"),
         )
 
 
@@ -88,6 +122,7 @@ class BatchCheckResult:
     result: List[Dict[str, Any]]
     authorization_model_id: str = ""
     object: str = "fga.batch_check"
+    consistency_token: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "BatchCheckResult":
@@ -95,6 +130,7 @@ class BatchCheckResult:
             result=list(d.get("result", [])),
             authorization_model_id=d.get("authorization_model_id", ""),
             object=d.get("object", "fga.batch_check"),
+            consistency_token=d.get("consistency_token"),
         )
 
 
@@ -105,6 +141,55 @@ class Tuple:
     target: str
     created_at: int = 0
     object: str = "fga.tuple"
+    #: ``{"name", "context"?}``; present only when the tuple has a condition.
+    condition: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class TupleChange:
+    """One entry of the changes feed (``operation`` is ``write`` or ``delete``)."""
+
+    operation: str
+    user: str
+    relation: str
+    target: str
+    consistency_token: str = ""
+    created_at: int = 0  # epoch ms
+    condition: Optional[Dict[str, Any]] = None
+    object: str = "fga.tuple_change"
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TupleChange":
+        return cls(
+            operation=d.get("operation", ""),
+            user=d.get("user", ""),
+            relation=d.get("relation", ""),
+            target=d.get("target", ""),
+            consistency_token=d.get("consistency_token", ""),
+            created_at=int(d.get("created_at", 0)),
+            condition=d.get("condition"),
+            object=d.get("object", "fga.tuple_change"),
+        )
+
+
+@dataclass
+class ChangesPage:
+    """A page of the changes feed. Keep ``continuation_token`` (returned even on
+    the last page) and pass it later to receive only newer changes."""
+
+    data: List[TupleChange]
+    has_more: bool = False
+    continuation_token: str = ""
+    object: str = "list"
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ChangesPage":
+        return cls(
+            data=[TupleChange.from_dict(x) for x in d.get("data", [])],
+            has_more=bool(d.get("has_more", False)),
+            continuation_token=d.get("continuation_token", ""),
+            object=d.get("object", "list"),
+        )
 
 
 @dataclass
@@ -249,6 +334,11 @@ class AtlasFga:
             )
         return store
 
+    @staticmethod
+    def _opts(body: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
+        """Merge optional fields into ``body``, dropping the ``None`` ones."""
+        return {k: v for k, v in {**body, **extra}.items() if v is not None}
+
     def _with_model(self, body: Dict[str, Any]) -> Dict[str, Any]:
         if body.get("authorization_model_id") is None and self._model_id is not None:
             body = {**body, "authorization_model_id": self._model_id}
@@ -264,9 +354,16 @@ class AtlasFga:
         object: str,  # noqa: A002 - matches the OpenFGA tuple vocabulary
         authorization_model_id: Optional[str] = None,
         contextual_tuples: Optional[List[TupleKey]] = None,
+        context: Optional[Dict[str, Any]] = None,
+        consistency: Optional[Consistency] = None,
+        consistency_token: Optional[str] = None,
         store_id: Optional[str] = None,
     ) -> CheckResult:
-        """Resolve a single access question."""
+        """Resolve a single access question.
+
+        ``context`` supplies request-time values for condition parameters;
+        ``consistency_token`` (from a prior write) guarantees the read reflects it.
+        """
         store = self._store(store_id)
         body = self._with_model(
             {
@@ -275,6 +372,9 @@ class AtlasFga:
                 "object": object,
                 "authorization_model_id": authorization_model_id,
                 "contextual_tuples": contextual_tuples,
+                "context": context,
+                "consistency": consistency,
+                "consistency_token": consistency_token,
             }
         )
         body = {k: v for k, v in body.items() if v is not None}
@@ -321,6 +421,9 @@ class AtlasFga:
         type: str,  # noqa: A002 - matches the OpenFGA list-objects vocabulary
         authorization_model_id: Optional[str] = None,
         contextual_tuples: Optional[List[TupleKey]] = None,
+        context: Optional[Dict[str, Any]] = None,
+        consistency: Optional[Consistency] = None,
+        consistency_token: Optional[str] = None,
         store_id: Optional[str] = None,
     ) -> ListObjectsResult:
         """List the objects of a ``type`` a ``user`` has a ``relation`` to."""
@@ -332,6 +435,9 @@ class AtlasFga:
                 "type": type,
                 "authorization_model_id": authorization_model_id,
                 "contextual_tuples": contextual_tuples,
+                "context": context,
+                "consistency": consistency,
+                "consistency_token": consistency_token,
             }
         )
         body = {k: v for k, v in body.items() if v is not None}
@@ -373,15 +479,101 @@ class AtlasFga:
         checks: List[Dict[str, Any]],
         *,
         authorization_model_id: Optional[str] = None,
+        consistency: Optional[Consistency] = None,
+        consistency_token: Optional[str] = None,
         store_id: Optional[str] = None,
     ) -> BatchCheckResult:
-        """Resolve MANY access questions in one round trip (<=100)."""
+        """Resolve MANY access questions in one round trip (<=100).
+
+        Each check may carry its own ``context``.
+        """
         store = self._store(store_id)
-        body = self._with_model({"checks": checks, "authorization_model_id": authorization_model_id})
+        body = self._with_model(
+            {
+                "checks": checks,
+                "authorization_model_id": authorization_model_id,
+                "consistency": consistency,
+                "consistency_token": consistency_token,
+            }
+        )
         body = {k: v for k, v in body.items() if v is not None}
         return BatchCheckResult.from_dict(
             self._request("POST", f"/v1/fga/stores/{quote(store)}/batch-check", body)
         )
+
+    def list_users(
+        self,
+        *,
+        object: str,  # noqa: A002 - "type:id"
+        relation: str,
+        user_filters: List[Dict[str, str]],
+        authorization_model_id: Optional[str] = None,
+        contextual_tuples: Optional[List[TupleKey]] = None,
+        context: Optional[Dict[str, Any]] = None,
+        consistency: Optional[Consistency] = None,
+        consistency_token: Optional[str] = None,
+        page_size: Optional[int] = None,
+        continuation_token: Optional[str] = None,
+        store_id: Optional[str] = None,
+    ) -> ListUsersResult:
+        """List the users with a ``relation`` to ``object``.
+
+        ``user_filters`` holds exactly one ``{"type": ..., "relation"?: ...}``.
+        ``page_size`` is 1-1000 (default 1000).
+        """
+        store = self._store(store_id)
+        body = self._opts(
+            self._with_model({"object": object, "relation": relation, "user_filters": user_filters,
+                              "authorization_model_id": authorization_model_id}),
+            contextual_tuples=contextual_tuples, context=context, consistency=consistency,
+            consistency_token=consistency_token, page_size=page_size,
+            continuation_token=continuation_token,
+        )
+        return ListUsersResult.from_dict(
+            self._request("POST", f"/v1/fga/stores/{quote(store)}/list-users", body)
+        )
+
+    def list_all_users(self, **kwargs: Any) -> ListUsersResult:
+        """Like :meth:`list_users`, but follows ``continuation_token`` and merges all pages."""
+        kwargs.pop("continuation_token", None)
+        merged = self.list_users(**kwargs)
+        token = merged.continuation_token
+        while token:
+            page = self.list_users(continuation_token=token, **kwargs)
+            merged.users += page.users
+            merged.excluded_users += [u for u in page.excluded_users if u not in merged.excluded_users]
+            merged.consistency_token = page.consistency_token or merged.consistency_token
+            token = merged.continuation_token = page.continuation_token
+        return merged
+
+    def read_changes(
+        self,
+        *,
+        type: Optional[str] = None,  # noqa: A002
+        page_size: Optional[int] = None,
+        continuation_token: Optional[str] = None,
+        start_time: Optional[str] = None,
+        store_id: Optional[str] = None,
+    ) -> ChangesPage:
+        """Read the tuple changes feed (``page_size`` 1-100, default 50; ``start_time`` RFC 3339)."""
+        store = self._store(store_id)
+        q = {"type": type, "page_size": page_size, "continuation_token": continuation_token,
+             "start_time": start_time}
+        qs = urlencode({k: v for k, v in q.items() if v is not None})
+        path = f"/v1/fga/stores/{quote(store)}/changes" + (f"?{qs}" if qs else "")
+        return ChangesPage.from_dict(self._request("GET", path))
+
+    def iter_changes(self, **kwargs: Any) -> Iterator[ChangesPage]:
+        """Yield pages of :meth:`read_changes` until ``has_more`` is false.
+
+        The last page's ``continuation_token`` is the cursor for next time.
+        """
+        while True:
+            page = self.read_changes(**kwargs)
+            yield page
+            if not page.has_more:
+                return
+            kwargs["continuation_token"] = page.continuation_token
 
     def store(self, store_id: str) -> "BoundStore":
         """Bind a store id for a scope of calls, OpenFGA-SDK style."""
@@ -469,3 +661,15 @@ class BoundStore:
 
     def batch_check(self, checks: List[Dict[str, Any]], **kwargs: Any) -> BatchCheckResult:
         return self._c.batch_check(checks, store_id=self._store_id, **kwargs)
+
+    def list_users(self, **kwargs: Any) -> ListUsersResult:
+        return self._c.list_users(store_id=self._store_id, **kwargs)
+
+    def list_all_users(self, **kwargs: Any) -> ListUsersResult:
+        return self._c.list_all_users(store_id=self._store_id, **kwargs)
+
+    def read_changes(self, **kwargs: Any) -> ChangesPage:
+        return self._c.read_changes(store_id=self._store_id, **kwargs)
+
+    def iter_changes(self, **kwargs: Any) -> Iterator[ChangesPage]:
+        return self._c.iter_changes(store_id=self._store_id, **kwargs)

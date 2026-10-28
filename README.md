@@ -38,12 +38,81 @@ default `https://api.atlasauth.net`). So `AtlasFga()` works when those are set.
 | `write(writes=, deletes=)` / `write_tuples(...)` / `delete_tuples(...)` | `POST /v1/fga/stores/:store/write` |
 | `read(user=, relation=, object=)` | `POST /v1/fga/stores/:store/read` |
 | `list_objects(user=, relation=, type=)` | `POST /v1/fga/stores/:store/list-objects` |
+| `list_users(object=, relation=, user_filters=)` / `list_all_users(...)` | `POST /v1/fga/stores/:store/list-users` |
+| `read_changes(type=, page_size=, continuation_token=, start_time=)` / `iter_changes(...)` | `GET /v1/fga/stores/:store/changes` |
 | `expand(object=, relation=)` | `POST /v1/fga/stores/:store/expand` |
 | `list_stores` / `create_store` / `get_store` / `delete_store` | `/v1/fga/stores` |
 | `list_models` / `create_model` / `get_model` | `/v1/fga/stores/:store/authorization-models` |
 
 `fga.store("store_id")` returns a `BoundStore` with the store id fixed, for the
 common single-store case.
+
+## Conditions and context
+
+A tuple may carry a `condition` (`{"name": ..., "context": {...}}`, context
+optional); the model declares them in a top-level `conditions` map passed to
+`create_model(..., conditions=...)`:
+
+```python
+fga.create_model(
+    type_definitions,
+    conditions={
+        "in_window": {
+            "expression": "request_time < expires",
+            "parameters": {
+                "request_time": {"type_name": "TYPE_NAME_TIMESTAMP"},
+                "expires": {"type_name": "TYPE_NAME_TIMESTAMP"},
+            },
+        }
+    },
+)
+fga.write_tuples([{
+    "user": "user:alice", "relation": "viewer", "object": "doc:readme",
+    "condition": {"name": "in_window", "context": {"expires": "2027-01-01T00:00:00Z"}},
+}])
+fga.check(user="user:alice", relation="viewer", object="doc:readme",
+          context={"request_time": "2026-10-27T00:00:00Z"}).allowed
+```
+
+`context` (request-time values for condition parameters) is accepted by
+`check`, `list_objects`, `list_users`, and on each item of `batch_check`.
+Tuples returned by `read` and the changes feed include `condition` only when
+they have one.
+
+## Consistency
+
+`check`, `batch_check`, `list_objects` and `list_users` accept `consistency`
+(`"UNSPECIFIED"`, `"MINIMIZE_LATENCY"`, `"HIGHER_CONSISTENCY"`) and
+`consistency_token`. `MINIMIZE_LATENCY` (the default) may be served from a
+short-lived cache; `HIGHER_CONSISTENCY` bypasses it. Every write and read
+result carries a `consistency_token`; pass the token from a write to guarantee
+the read reflects at least that write, e.g. right after revoking access:
+
+```python
+w = fga.delete_tuples([{"user": "user:alice", "relation": "viewer", "object": "doc:readme"}])
+fga.check(user="user:alice", relation="viewer", object="doc:readme",
+          consistency_token=w.consistency_token).allowed  # False
+```
+
+## Listing users and following changes
+
+```python
+res = fga.list_users(object="doc:readme", relation="viewer", user_filters=[{"type": "user"}])
+res.users            # "user:alice", a userset "team:eng#member", or a wildcard "user:*"
+res.excluded_users   # ids a wildcard does not cover
+fga.list_all_users(object="doc:readme", relation="viewer", user_filters=[{"type": "user"}])  # all pages
+
+page = fga.read_changes(type="doc", page_size=50)
+for page in fga.iter_changes(type="doc"):        # until has_more is false
+    for c in page.data:
+        print(c.operation, c.user, c.relation, c.target)
+# keep page.continuation_token (returned even on the last page) and pass it
+# later as continuation_token= to receive only newer changes.
+```
+
+`user_filters` takes exactly one `{"type": ..., "relation"?: ...}`; `page_size`
+is 1-1000 for `list_users` (default 1000) and 1-100 for `read_changes`
+(default 50); `start_time` is RFC 3339.
 
 ## Errors
 

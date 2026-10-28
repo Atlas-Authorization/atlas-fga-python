@@ -26,12 +26,15 @@ from .client import (
     AuthorizationModel,
     BatchCheckResult,
     BoundStore,
+    ChangesPage,
     CheckResult,
     ExpandResult,
     ListObjectsResult,
     ListPage,
+    ListUsersResult,
     Store,
     Tuple,
+    TupleChange,
     WriteResult,
 )
 
@@ -42,12 +45,15 @@ __all__ = [
     "AuthorizationModel",
     "BatchCheckResult",
     "BoundStore",
+    "ChangesPage",
     "CheckResult",
     "ExpandResult",
     "ListObjectsResult",
     "ListPage",
+    "ListUsersResult",
     "Store",
     "Tuple",
+    "TupleChange",
     "WriteResult",
 ]
 
